@@ -1,0 +1,1688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#3d8fd6">
+<title>Human Runner</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;    /* no pull-to-refresh on Android */
+    background: #7fc0ee;
+  }
+  body {
+    position: fixed;              /* no rubber-band scrolling on iOS */
+    inset: 0;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    touch-action: none;           /* no zoom / scroll on tap */
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #safe-probe {
+    position: fixed;
+    left: 0;
+    top: 0;
+    visibility: hidden;
+    pointer-events: none;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="safe-probe"></div>
+<script>
+"use strict";
+
+/* =========================================================
+   CONFIG: every gameplay value lives here (logical units)
+   ========================================================= */
+const CONFIG = {
+  // The view always shows at least this much of the world.
+  minViewW: 560,
+  minViewH: 300,
+  groundOffset: 70,        // ground line distance from the bottom (landscape)
+  portraitLift: 0.35,      // in portrait, lift the ground toward the middle
+
+  step: 1 / 120,           // fixed physics step (s)
+  maxFrameDt: 0.1,         // clamp after tab switch / lag (s)
+
+  gravity: 2600,           // units/s^2
+  jumpVelocity: 900,       // units/s  -> ~156 high, ~0.69 s in the air
+  jumpBuffer: 0.12,        // a press just before landing still jumps (s)
+
+  speed: 380,              // start speed (units/s)
+  maxSpeed: 760,           // speed cap, reached after ~1000 running points
+  speedPerPoint: 0.38,     // speed gained per running point
+  unitsPerPoint: 40,       // distance needed for +1 point (~10 pts/s at start)
+  firstGapTime: 1.4,       // breathing room before the first obstacle (s)
+  gapMinTime: 1.0,         // min travel time between obstacles (> air time)
+  gapMaxTime: 1.8,
+  restartDelay: 0.4,       // ignore input right after Game Over (s)
+
+  runner: { x: 80, w: 34, h: 62 },
+  runnerHitbox: { x: 8, top: 6, bottom: 2 },   // inset from the drawing
+  obstacleHitboxInset: 2,
+
+  obstacles: [
+    { name: "small",  w: 26, h: 30, boxes: 1 },
+    { name: "big",    w: 32, h: 52, boxes: 1 },
+    { name: "double", w: 54, h: 30, boxes: 2 },
+  ],
+
+  // coins
+  coinChance: 0.75,        // chance an obstacle comes with a coin pattern
+  coinRadius: 7,
+  coinPickupMargin: 4,     // generous pickup
+  coinValue: 3,
+  comboWindow: 1.0,        // max seconds between coins to keep the combo
+  maxCombo: 3,             // x1, x2, x3
+
+  // effects
+  shakeTime: 0.35,
+  shakeAmp: 5,
+  dustInterval: 0.05,
+};
+
+const TEXTS = {
+  dar: {
+    title: "R-Rajel li Kayjri",
+    start: "Wrek 3la Espace wla tap bach tbda",
+    score: "Natija",
+    best: "A7san natija",
+    coins: "Pi9ass",
+    over: "Salat l'game!",
+    newBest: "Record jdid!",
+    retry: "Wrek 3la Espace wla tap bach t3awd",
+    paused: "Pause",
+    resume: "Wrek 3la Espace wla tap bach tkml",
+  },
+  en: {
+    title: "Human Runner",
+    start: "Press Space or tap to start",
+    score: "Score",
+    best: "Best",
+    coins: "Coins",
+    over: "Game Over!",
+    newBest: "New best!",
+    retry: "Press Space or tap to retry",
+    paused: "Paused",
+    resume: "Press Space or tap to continue",
+  },
+};
+
+/* =========================================================
+   Storage: safe wrapper (private mode / blocked storage -> no crash)
+   ========================================================= */
+const STORAGE_KEYS = { best: "humanRunner.best", lang: "humanRunner.lang" };
+const storage = {
+  get(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  },
+  set(key, value) {
+    try { localStorage.setItem(key, String(value)); } catch (e) { /* ignore */ }
+  },
+};
+
+let lang = storage.get(STORAGE_KEYS.lang) === "en" ? "en" : "dar";
+const t = (key) => TEXTS[lang][key];
+
+function setLanguage(next) {
+  lang = next;
+  storage.set(STORAGE_KEYS.lang, lang);
+}
+
+/* =========================================================
+   Colors
+   ========================================================= */
+const COLORS = {
+  skyTop: "#3d8fd6",
+  skyMid: "#7fc0ee",
+  skyHorizon: "#d9eef8",
+
+  fieldTop: "#64b33f",
+  fieldBottom: "#3c8a2b",
+
+  box: "#c9925a",
+  boxBottom: "#a46c39",
+  boxFrame: "#7b4f27",
+  boxBrace: "#8f5d2e",
+  nail: "#4a3420",
+
+  coinLight: "#fff3b0",
+  coin: "#ffd23f",
+  coinDark: "#d99a00",
+  coinEdge: "#a87200",
+
+  text: "#1d3557",
+  textSoft: "#3b5a80",
+  accent: "#e76f51",
+  gold: "#e0a100",
+  panel: "rgba(255,255,255,0.9)",
+  dim: "rgba(29,53,87,0.4)",
+  button: "rgba(255,255,255,0.88)",
+  hitbox: "rgba(255,0,0,0.8)",
+};
+
+// The kid: far-side limbs use darker colors (depth).
+const KID_FRONT = {
+  skin: "#c98b55", shirt: "#ffffff", shirtLine: "#9fb0c3",
+  shorts: "#2f4f86", shoe: "#d62828", sole: "#f4f4f4",
+};
+const KID_BACK = {
+  skin: "#a8703f", shirt: "#dde3ea", shirtLine: "#8d9db0",
+  shorts: "#223a63", shoe: "#a51d1d", sole: "#cfcfcf",
+};
+const KID = {
+  hair: "#1f140c",
+  fez: "#c1272d",
+  fezDark: "#8e1a1f",
+  fezLight: "#e04048",
+  tassel: "#151515",
+  star: "#006233",
+  eyeWhite: "#ffffff",
+  pupil: "#1b120c",
+  mouth: "#7a2a1a",
+  blush: "rgba(230,90,90,0.35)",
+};
+
+const DEBUG = new URLSearchParams(location.search).has("debug");
+const TAU = Math.PI * 2;
+
+/* =========================================================
+   Helpers
+   ========================================================= */
+function rand(min, max) {
+  return min + Math.random() * (max - min);
+}
+function lerp(a, b, k) {
+  return a + (b - a) * k;
+}
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
+// Deterministic RNG so the scenery looks the same after a resize.
+function seededRandom(seed) {
+  return function () {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let z = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    z = (z + Math.imul(z ^ (z >>> 7), 61 | z)) ^ z;
+    return ((z ^ (z >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function pick(rng, list) {
+  return list[Math.floor(rng() * list.length)];
+}
+function starPath(g, cx, cy, outer, inner, points) {
+  g.beginPath();
+  for (let i = 0; i < points * 2; i++) {
+    const r = i % 2 === 0 ? outer : inner;
+    const a = -Math.PI / 2 + (i * Math.PI) / points;
+    const x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+    if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+  }
+  g.closePath();
+}
+
+/* =========================================================
+   Canvas & responsive view
+   ========================================================= */
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const safeProbe = document.getElementById("safe-probe");
+const view = {
+  w: CONFIG.minViewW, h: CONFIG.minViewH, scale: 1, dpr: 1, groundY: 230,
+  safe: { top: 0, right: 0, left: 0 },   // notch / rounded corners (world units)
+  portrait: false,
+};
+
+function resize() {
+  const rect = canvas.getBoundingClientRect();
+  const cssW = Math.max(1, rect.width);
+  const cssH = Math.max(1, rect.height);
+  view.dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+  canvas.width = Math.round(cssW * view.dpr);
+  canvas.height = Math.round(cssH * view.dpr);
+
+  view.scale = Math.min(cssW / CONFIG.minViewW, cssH / CONFIG.minViewH);
+  view.w = cssW / view.scale;
+  view.h = cssH / view.scale;
+  const extraH = Math.max(0, view.h - CONFIG.minViewH);
+  view.groundY = view.h - CONFIG.groundOffset - extraH * CONFIG.portraitLift;
+
+  const cs = getComputedStyle(safeProbe);
+  view.safe.top = (parseFloat(cs.paddingTop) || 0) / view.scale;
+  view.safe.right = (parseFloat(cs.paddingRight) || 0) / view.scale;
+  view.safe.left = (parseFloat(cs.paddingLeft) || 0) / view.scale;
+
+  // Rotating the phone mid-run is disorienting: pause instead.
+  const portrait = cssH > cssW;
+  if (portrait !== view.portrait) pauseGame();
+  view.portrait = portrait;
+
+  buildScenery();
+}
+window.addEventListener("resize", resize);
+window.addEventListener("orientationchange", resize);
+
+/* =========================================================
+   Scenery: pre-rendered tiles + procedural layers
+   ========================================================= */
+const scenery = {
+  res: 1,                 // pixels per world unit for offscreen tiles
+  sky: null,
+  grassBack: null,        // tall blades behind the runner
+  grassFront: null,       // short blades + flowers in front of the runner
+  fieldTexture: null,     // meadow texture below the ground line
+  cloudSprites: [],
+  clouds: [],
+  trees: [],
+};
+
+const RIDGE_PERIOD = 1600;  // world units before a background layer repeats
+const LAYERS = {
+  mountains: {
+    factor: 0.04, base: 42,
+    waves: [
+      { k: 1, a: 34, p: 0.3, sharp: true },
+      { k: 3, a: 26, p: 1.7, sharp: true },
+      { k: 7, a: 10, p: 0.9, sharp: false },
+      { k: 17, a: 4, p: 2.2, sharp: false },
+    ],
+    top: "#9fb9d0", bottom: "#c8dbe8",
+  },
+  hills: {
+    factor: 0.12, base: 16,
+    waves: [
+      { k: 2, a: 24, p: 0.6 },
+      { k: 5, a: 12, p: 2.4 },
+      { k: 11, a: 4, p: 1.1 },
+    ],
+    top: "#87ad72", bottom: "#a3c48e",
+  },
+  near: {
+    factor: 0.25, base: 4,
+    waves: [
+      { k: 3, a: 16, p: 1.4 },
+      { k: 8, a: 7, p: 0.2 },
+      { k: 19, a: 2, p: 2.9 },
+    ],
+    top: "#5f9a48", bottom: "#76ad5a",
+  },
+};
+
+function ridgeHeight(layer, worldX) {
+  let h = layer.base;
+  for (const w of layer.waves) {
+    const s = Math.sin((TAU * w.k * worldX) / RIDGE_PERIOD + w.p);
+    h += w.sharp ? w.a * (1 - Math.abs(s)) : w.a * (0.5 + 0.5 * s);
+  }
+  return h;
+}
+
+function makeTile(w, h, draw, resOverride) {
+  const res = resOverride || scenery.res;
+  const c = document.createElement("canvas");
+  c.width = Math.ceil(w * res);
+  c.height = Math.ceil(h * res);
+  const g = c.getContext("2d");
+  g.scale(res, res);
+  g.lineCap = "round";
+  draw(g, w, h);
+  return { canvas: c, w, h };
+}
+
+// Draw something near a tile edge twice so the tile repeats seamlessly.
+function wrapped(x, w, margin, fn) {
+  fn(x);
+  if (x < margin) fn(x + w);
+  if (x > w - margin) fn(x - w);
+}
+
+function drawBlade(g, x, baseY, height, bend, width, color) {
+  g.strokeStyle = color;
+  g.lineWidth = width;
+  g.beginPath();
+  g.moveTo(x, baseY);
+  g.quadraticCurveTo(x + bend * 0.3, baseY - height * 0.6, x + bend, baseY - height);
+  g.stroke();
+}
+
+function drawFlower(g, x, baseY, height, kind) {
+  const tipX = x + 0.6, tipY = baseY - height;
+  g.strokeStyle = "#4f8f2f";
+  g.lineWidth = 0.7;
+  g.beginPath();
+  g.moveTo(x, baseY);
+  g.quadraticCurveTo(x + 0.8, baseY - height * 0.5, tipX, tipY);
+  g.stroke();
+
+  if (kind === "poppy") {
+    g.fillStyle = "#e0332c";
+    g.beginPath(); g.arc(tipX, tipY, 2.3, 0, TAU); g.fill();
+    g.fillStyle = "#c22520";
+    g.beginPath(); g.arc(tipX + 0.7, tipY + 0.4, 1.2, 0, TAU); g.fill();
+    g.fillStyle = "#2b1a14";
+    g.beginPath(); g.arc(tipX, tipY, 0.7, 0, TAU); g.fill();
+  } else if (kind === "daisy") {
+    g.fillStyle = "#ffffff";
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * TAU;
+      g.beginPath(); g.arc(tipX + Math.cos(a) * 1.5, tipY + Math.sin(a) * 1.5, 1.1, 0, TAU); g.fill();
+    }
+    g.fillStyle = "#f4c430";
+    g.beginPath(); g.arc(tipX, tipY, 0.9, 0, TAU); g.fill();
+  } else if (kind === "yellow") {
+    g.fillStyle = "#ffd23f";
+    g.beginPath(); g.arc(tipX, tipY, 1.8, 0, TAU); g.fill();
+    g.fillStyle = "#f0a81c";
+    g.beginPath(); g.arc(tipX, tipY, 0.7, 0, TAU); g.fill();
+  } else {
+    g.fillStyle = "#a67de0";
+    for (let i = 0; i < 4; i++) {
+      g.beginPath(); g.arc(tipX, tipY - i * 1.3, 1.1 - i * 0.15, 0, TAU); g.fill();
+    }
+  }
+}
+
+const GRASS_BACK_COLORS = ["#4f9a2f", "#5aa835", "#66b33c", "#3f8a28", "#72bd45"];
+const GRASS_FRONT_COLORS = ["#6cbf3f", "#7ccb4b", "#5aad36", "#88d058"];
+const FLOWER_KINDS = ["poppy", "poppy", "daisy", "daisy", "yellow", "lavender"];
+
+function buildScenery() {
+  scenery.res = clamp(view.dpr * view.scale, 1, 3);
+  const TILE_W = 240;
+
+  // Tall blades along the ground line (tile y=16 is the ground line).
+  scenery.grassBack = makeTile(TILE_W, 26, (g, w) => {
+    const rng = seededRandom(11);
+    for (let i = 0; i < 650; i++) {
+      const x = rng() * w;
+      const base = 16 + rng() * 7;
+      const h = 4 + rng() * 10;
+      const bend = (rng() - 0.4) * 4;
+      const color = pick(rng, GRASS_BACK_COLORS);
+      const width = 0.8 + rng() * 0.8;
+      wrapped(x, w, 6, (xx) => drawBlade(g, xx, base, h, bend, width, color));
+    }
+  });
+
+  // Short blades and spring flowers in front (tile y=10 is the ground line).
+  scenery.grassFront = makeTile(TILE_W, 16, (g, w) => {
+    const rng = seededRandom(23);
+    for (let i = 0; i < 260; i++) {
+      const x = rng() * w;
+      const base = 11 + rng() * 5;
+      const h = 2.5 + rng() * 4.5;
+      const bend = (rng() - 0.4) * 3;
+      const color = pick(rng, GRASS_FRONT_COLORS);
+      const width = 0.7 + rng() * 0.6;
+      wrapped(x, w, 5, (xx) => drawBlade(g, xx, base, h, bend, width, color));
+    }
+    for (let i = 0; i < 11; i++) {
+      const x = rng() * w;
+      const kind = pick(rng, FLOWER_KINDS);
+      const h = 4 + rng() * 4;
+      wrapped(x, w, 4, (xx) => drawFlower(g, xx, 13, h, kind));
+    }
+  });
+
+  // Meadow texture below the ground line: grass tufts + scattered flowers.
+  scenery.fieldTexture = makeTile(TILE_W, 120, (g, w, h) => {
+    const rng = seededRandom(37);
+    for (let i = 0; i < 900; i++) {
+      const x = rng() * w;
+      const y = rng() * h;
+      const light = rng() < 0.5;
+      g.strokeStyle = light ? "rgba(140,210,90,0.35)" : "rgba(30,90,20,0.25)";
+      g.lineWidth = 0.6 + rng() * 0.6;
+      const len = 1.5 + rng() * 3;
+      const lean = (rng() - 0.5) * 1.5;
+      wrapped(x, w, 3, (xx) => {
+        g.beginPath();
+        g.moveTo(xx, y);
+        g.lineTo(xx + lean, y - len);
+        g.stroke();
+      });
+    }
+    const dots = ["#e0332c", "#ffffff", "#ffd23f", "#a67de0"];
+    for (let i = 0; i < 70; i++) {
+      const x = rng() * w;
+      const y = rng() * h;
+      g.fillStyle = pick(rng, dots);
+      const r = 0.6 + rng() * 0.9;
+      wrapped(x, w, 2, (xx) => { g.beginPath(); g.arc(xx, y, r, 0, TAU); g.fill(); });
+    }
+  });
+
+  buildSky();
+  buildClouds();
+  buildTrees();
+}
+
+// Sky + sun never move: render them once per resize at low resolution
+// (smooth gradients scale up without visible loss).
+function buildSky() {
+  scenery.sky = makeTile(view.w, view.groundY + 2, (g, w, h) => {
+    const grad = g.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, COLORS.skyTop);
+    grad.addColorStop(0.6, COLORS.skyMid);
+    grad.addColorStop(1, COLORS.skyHorizon);
+    g.fillStyle = grad;
+    g.fillRect(0, 0, w, h);
+
+    const sx = w * 0.8, sy = Math.min(70, h * 0.3);
+    const glow = g.createRadialGradient(sx, sy, 4, sx, sy, 90);
+    glow.addColorStop(0, "rgba(255,250,225,0.95)");
+    glow.addColorStop(0.15, "rgba(255,244,200,0.7)");
+    glow.addColorStop(1, "rgba(255,244,200,0)");
+    g.fillStyle = glow;
+    g.fillRect(sx - 90, sy - 90, 180, 180);
+  }, 1);
+}
+
+// Soft cumulus clouds: many radial-gradient puffs, flat-ish base, shaded bottom.
+function makeCloudSprite(rng) {
+  const w = 150, h = 70;
+  return makeTile(w, h, (g) => {
+    const baseY = 54;
+    const puffs = 9 + Math.floor(rng() * 6);
+    for (let i = 0; i < puffs; i++) {
+      const u = i / (puffs - 1);
+      const x = 22 + u * (w - 44) + (rng() - 0.5) * 10;
+      const bell = Math.sin(u * Math.PI);
+      const r = 10 + bell * 16 + rng() * 6;
+      const y = Math.min(baseY - r * 0.55, baseY - 6 - bell * 14 + (rng() - 0.5) * 6);
+      const grad = g.createRadialGradient(x - r * 0.2, y - r * 0.3, r * 0.1, x, y, r);
+      grad.addColorStop(0, "rgba(255,255,255,1)");
+      grad.addColorStop(0.65, "rgba(255,255,255,0.95)");
+      grad.addColorStop(1, "rgba(255,255,255,0)");
+      g.fillStyle = grad;
+      g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+    }
+    // shade the underside, only where the cloud already is
+    g.globalCompositeOperation = "source-atop";
+    const shade = g.createLinearGradient(0, 18, 0, baseY + 6);
+    shade.addColorStop(0, "rgba(160,180,205,0)");
+    shade.addColorStop(1, "rgba(150,170,198,0.55)");
+    g.fillStyle = shade;
+    g.fillRect(0, 0, w, h);
+    g.globalCompositeOperation = "source-over";
+  });
+}
+
+function buildClouds() {
+  const rng = seededRandom(51);
+  scenery.cloudSprites = [];
+  for (let i = 0; i < 5; i++) scenery.cloudSprites.push(makeCloudSprite(rng));
+
+  const skyBottom = view.groundY - 110;
+  const area = view.w * Math.max(60, skyBottom);
+  const count = clamp(Math.round(area / 26000), 4, 14);
+  scenery.clouds = [];
+  for (let i = 0; i < count; i++) {
+    const s = 0.5 + rng() * 0.7;                  // smaller = farther
+    scenery.clouds.push({
+      sprite: scenery.cloudSprites[i % scenery.cloudSprites.length],
+      x: rng() * (view.w + 160) - 80,
+      y: 8 + rng() * Math.max(20, skyBottom - 40),
+      s,
+      alpha: 0.65 + s * 0.3,
+    });
+  }
+  scenery.clouds.sort((a, b) => a.s - b.s);      // far clouds drawn first
+}
+
+function buildTrees() {
+  const rng = seededRandom(77);
+  scenery.trees = [];
+  let x = 0;
+  while (x < RIDGE_PERIOD) {
+    x += 18 + rng() * 70;
+    if (x >= RIDGE_PERIOD) break;
+    const cluster = 1 + Math.floor(rng() * 3);
+    for (let i = 0; i < cluster; i++) {
+      scenery.trees.push({
+        x: x + i * (6 + rng() * 6),
+        h: 10 + rng() * 12,
+        cypress: rng() < 0.3,
+        shade: rng(),
+      });
+    }
+  }
+}
+
+/* =========================================================
+   Game state
+   ========================================================= */
+const game = {
+  state: "ready",          // "ready" | "playing" | "paused" | "over"
+  speed: CONFIG.speed,
+  distance: 0,
+  scroll: 0,               // never reset: keeps the scenery continuous
+  time: 0,
+  score: 0,                // running points + coin bonus
+  bonus: 0,
+  coinsCollected: 0,
+  combo: 0,
+  lastCoinTime: -99,
+  best: parseInt(storage.get(STORAGE_KEYS.best), 10) || 0,
+  newBest: false,
+  overTimer: 0,
+  shake: 0,
+  nextGap: 0,              // distance left before the next spawn
+  obstacles: [],
+  coins: [],
+  particles: [],
+  popups: [],
+  dustTimer: 0,
+};
+
+const runner = {
+  y: 0,                    // feet height above ground (up = positive)
+  vy: 0,
+  onGround: true,
+  jumpBuffer: 0,
+  runPhase: 0,             // 0..1 run cycle
+};
+
+function resetGame() {
+  game.speed = CONFIG.speed;
+  game.distance = 0;
+  game.score = 0;
+  game.bonus = 0;
+  game.coinsCollected = 0;
+  game.combo = 0;
+  game.lastCoinTime = -99;
+  game.newBest = false;
+  game.obstacles.length = 0;
+  game.coins.length = 0;
+  game.particles.length = 0;
+  game.popups.length = 0;
+  game.nextGap = game.speed * CONFIG.firstGapTime;
+  game.overTimer = 0;
+  game.shake = 0;
+  runner.y = 0;
+  runner.vy = 0;
+  runner.onGround = true;
+  runner.jumpBuffer = 0;
+  runner.runPhase = 0;
+}
+
+function startGame() {
+  resetGame();
+  game.state = "playing";
+}
+
+function gameOver() {
+  game.state = "over";
+  game.overTimer = 0;
+  game.shake = CONFIG.shakeTime;
+  const cx = CONFIG.runner.x + CONFIG.runner.w;
+  emitParticles(cx, view.groundY - runner.y - 20, 12, 160, 3, DUST_RGB);
+  if (game.score > game.best) {
+    game.best = game.score;
+    game.newBest = true;
+    storage.set(STORAGE_KEYS.best, game.best);
+  }
+}
+
+function pauseGame() {
+  if (game.state === "playing") game.state = "paused";
+}
+
+function resumeGame() {
+  if (game.state !== "paused") return;
+  runner.jumpBuffer = 0;
+  game.state = "playing";
+}
+
+/* =========================================================
+   Input
+   ========================================================= */
+function onAction() {
+  if (game.state === "ready") {
+    startGame();
+  } else if (game.state === "playing") {
+    runner.jumpBuffer = CONFIG.jumpBuffer;
+  } else if (game.state === "paused") {
+    resumeGame();
+  } else if (game.state === "over" && game.overTimer >= CONFIG.restartDelay) {
+    startGame();
+  }
+}
+
+// Top-left button: pause while playing, language switch [DAR | EN] otherwise.
+function buttonRect() {
+  const size = Math.max(36, 44 / view.scale);   // at least ~44 css px for fingers
+  const wide = game.state === "ready" || game.state === "over";
+  return {
+    x: 10 + view.safe.left,
+    y: 10 + view.safe.top,
+    w: size * (wide ? 2.6 : 1.3),
+    h: size,
+  };
+}
+
+function pressButton(x) {
+  if (game.state === "playing") pauseGame();
+  else if (game.state === "paused") resumeGame();
+  else {
+    const b = buttonRect();
+    setLanguage(x < b.x + b.w / 2 ? "dar" : "en");
+  }
+}
+
+window.addEventListener("keydown", (e) => {
+  if (e.code === "Space" || e.code === "ArrowUp") {
+    e.preventDefault();
+    if (!e.repeat) onAction();
+  } else if ((e.code === "Escape" || e.code === "KeyP") && !e.repeat) {
+    if (game.state === "playing") pauseGame();
+    else if (game.state === "paused") resumeGame();
+  }
+});
+
+canvas.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) / view.scale;
+  const y = (e.clientY - rect.top) / view.scale;
+  const b = buttonRect();
+  if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) {
+    pressButton(x);
+    return;
+  }
+  onAction();
+});
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+// iOS: block double-tap zoom and the long-press magnifier (pointer events still fire).
+canvas.addEventListener("touchstart", (e) => e.preventDefault(), { passive: false });
+canvas.addEventListener("touchend", (e) => e.preventDefault(), { passive: false });
+
+// Auto-pause when the player leaves the tab / app.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) pauseGame();
+});
+window.addEventListener("blur", pauseGame);
+
+/* =========================================================
+   Update (fixed step)
+   ========================================================= */
+const DUST_RGB = "200,182,145";
+const GOLD_RGB = "255,205,50";
+
+function emitParticles(x, y, count, spread, size, rgb) {
+  for (let i = 0; i < count; i++) {
+    const life = rand(0.35, 0.7);
+    game.particles.push({
+      x: x + rand(-3, 3),
+      y: y + rand(-2, 1),
+      vx: -game.speed * 0.5 + rand(-spread, spread * 0.5),
+      vy: -rand(20, 40 + spread * 0.4),
+      life,
+      max: life,
+      size: rand(1.2, size),
+      rgb,
+    });
+  }
+}
+
+function updateParticles(dt) {
+  for (const p of game.particles) {
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= 0.97;
+    p.vy *= 0.94;
+    p.life -= dt;
+  }
+  game.particles = game.particles.filter((p) => p.life > 0);
+
+  for (const p of game.popups) {
+    p.y -= 40 * dt;
+    p.life -= dt;
+  }
+  game.popups = game.popups.filter((p) => p.life > 0);
+}
+
+function addCoin(x, h) {
+  game.coins.push({ x, h, phase: Math.random() * TAU });
+}
+
+// Coin patterns are placed relative to the obstacle they come with,
+// so they are always reachable and never inside a box.
+function spawnCoins(o) {
+  if (Math.random() > CONFIG.coinChance) return;
+  const type = o.type;
+  const v = CONFIG.jumpVelocity, g = CONFIG.gravity;
+  const airTime = (2 * v) / g;
+  const r = Math.random();
+
+  if (r < 0.45) {
+    // arc that follows a well-timed jump over the obstacle
+    const center = o.x + type.w / 2;
+    const n = 5;
+    for (let i = 0; i < n; i++) {
+      const tt = airTime * (0.2 + (0.6 * i) / (n - 1));
+      const h = v * tt - 0.5 * g * tt * tt;
+      addCoin(center + (tt - airTime / 2) * game.speed, h + 26);
+    }
+  } else if (r < 0.75) {
+    // ground row after the obstacle: collect while running
+    const start = o.x + type.w + game.speed * 0.35;
+    for (let i = 0; i < 4; i++) addCoin(start + i * 24, 16);
+  } else {
+    // high row: rewards a late jump
+    const start = o.x + type.w + game.speed * 0.2;
+    for (let i = 0; i < 3; i++) addCoin(start + i * 24, 95);
+  }
+}
+
+function spawnObstacle() {
+  const type = CONFIG.obstacles[Math.floor(Math.random() * CONFIG.obstacles.length)];
+  const o = { type, x: view.w + 20 };
+  game.obstacles.push(o);
+  game.nextGap = type.w + game.speed * rand(CONFIG.gapMinTime, CONFIG.gapMaxTime);
+  spawnCoins(o);
+}
+
+function collectCoin(c) {
+  if (game.time - game.lastCoinTime <= CONFIG.comboWindow) {
+    game.combo = Math.min(CONFIG.maxCombo, game.combo + 1);
+  } else {
+    game.combo = 1;
+  }
+  game.lastCoinTime = game.time;
+  const points = CONFIG.coinValue * game.combo;
+  game.bonus += points;
+  game.coinsCollected += 1;
+
+  const y = view.groundY - c.h;
+  emitParticles(c.x, y, 6, 70, 2, GOLD_RGB);
+  game.popups.push({
+    x: c.x,
+    y: y - 12,
+    text: game.combo > 1 ? `+${points} x${game.combo}` : `+${points}`,
+    life: 0.7,
+    max: 0.7,
+  });
+}
+
+function updateCoins(dt) {
+  const move = game.speed * dt;
+  const hb = runnerHitbox();
+  const m = CONFIG.coinPickupMargin;
+  const r = CONFIG.coinRadius;
+  game.coins = game.coins.filter((c) => {
+    c.x -= move;
+    const cy = view.groundY - c.h;
+    // circle vs (slightly enlarged) runner box
+    const nx = clamp(c.x, hb.left - m, hb.right + m);
+    const ny = clamp(cy, hb.top - m, hb.bottom + m);
+    if ((c.x - nx) ** 2 + (cy - ny) ** 2 <= r * r) {
+      collectCoin(c);
+      return false;
+    }
+    return c.x > -20;
+  });
+}
+
+function updateRunner(dt) {
+  if (runner.jumpBuffer > 0) {
+    if (runner.onGround) {
+      runner.vy = CONFIG.jumpVelocity;
+      runner.onGround = false;
+      runner.jumpBuffer = 0;
+      emitParticles(CONFIG.runner.x + 14, view.groundY, 5, 60, 2.5, DUST_RGB);
+    } else {
+      runner.jumpBuffer -= dt;
+    }
+  }
+
+  if (!runner.onGround) {
+    runner.vy -= CONFIG.gravity * dt;
+    runner.y += runner.vy * dt;
+    if (runner.y <= 0) {
+      runner.y = 0;
+      runner.vy = 0;
+      runner.onGround = true;
+      emitParticles(CONFIG.runner.x + 17, view.groundY, 9, 90, 3, DUST_RGB);
+    }
+  } else {
+    // cadence grows with speed but stays readable (2.6 -> 4.2 strides/s)
+    const k = (game.speed - CONFIG.speed) / (CONFIG.maxSpeed - CONFIG.speed);
+    runner.runPhase = (runner.runPhase + dt * lerp(2.6, 4.2, k)) % 1;
+
+    game.dustTimer -= dt;
+    if (game.dustTimer <= 0) {
+      game.dustTimer = CONFIG.dustInterval;
+      emitParticles(CONFIG.runner.x + 12, view.groundY - 1, 1, 30, 2.2, DUST_RGB);
+    }
+  }
+}
+
+function updateObstacles(dt) {
+  const move = game.speed * dt;
+  for (const o of game.obstacles) o.x -= move;
+  while (game.obstacles.length && game.obstacles[0].x + game.obstacles[0].type.w < -20) {
+    game.obstacles.shift();
+  }
+
+  game.nextGap -= move;
+  if (game.nextGap <= 0) spawnObstacle();
+}
+
+function updateClouds(dt) {
+  const scrollSpeed = game.state === "playing" ? game.speed : 0;
+  for (const c of scenery.clouds) {
+    c.x -= (6 + scrollSpeed * 0.03) * c.s * dt;
+    const w = c.sprite.w * c.s;
+    if (c.x + w < -10) c.x += view.w + w + 40;
+  }
+}
+
+function runnerHitbox() {
+  const r = CONFIG.runner, hb = CONFIG.runnerHitbox;
+  const feetY = view.groundY - runner.y;
+  return {
+    left: r.x + hb.x,
+    right: r.x + r.w - hb.x,
+    top: feetY - r.h + hb.top,
+    bottom: feetY - hb.bottom,
+  };
+}
+
+function obstacleHitbox(o) {
+  const i = CONFIG.obstacleHitboxInset;
+  return {
+    left: o.x + i,
+    right: o.x + o.type.w - i,
+    top: view.groundY - o.type.h + i,
+    bottom: view.groundY,
+  };
+}
+
+function overlaps(a, b) {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
+
+function checkCollision() {
+  const rb = runnerHitbox();
+  for (const o of game.obstacles) {
+    if (overlaps(rb, obstacleHitbox(o))) return true;
+  }
+  return false;
+}
+
+function update(dt) {
+  if (game.state === "paused") return;
+
+  game.time += dt;
+  updateClouds(dt);
+  updateParticles(dt);
+  if (game.shake > 0) game.shake = Math.max(0, game.shake - dt);
+
+  if (game.state === "over") {
+    game.overTimer += dt;
+    // a runner who hit a box mid-air falls back to the ground
+    if (runner.y > 0) {
+      runner.vy -= CONFIG.gravity * dt;
+      runner.y = Math.max(0, runner.y + runner.vy * dt);
+    }
+    return;
+  }
+  if (game.state !== "playing") return;
+
+  game.distance += game.speed * dt;
+  game.scroll += game.speed * dt;
+  const runPoints = Math.floor(game.distance / CONFIG.unitsPerPoint);
+  game.score = runPoints + game.bonus;
+  game.speed = Math.min(CONFIG.maxSpeed, CONFIG.speed + runPoints * CONFIG.speedPerPoint);
+
+  updateRunner(dt);
+  updateObstacles(dt);
+  updateCoins(dt);
+  if (checkCollision()) gameOver();
+}
+
+/* =========================================================
+   Render: scenery
+   ========================================================= */
+function drawSky() {
+  const s = scenery.sky;
+  ctx.drawImage(s.canvas, 0, 0, s.w, s.h);
+}
+
+function drawClouds() {
+  for (const c of scenery.clouds) {
+    ctx.globalAlpha = c.alpha;
+    ctx.drawImage(c.sprite.canvas, c.x, c.y, c.sprite.w * c.s, c.sprite.h * c.s);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawRidge(layer) {
+  const shift = game.scroll * layer.factor;
+  const g = ctx.createLinearGradient(0, view.groundY - layer.base - 90, 0, view.groundY);
+  g.addColorStop(0, layer.top);
+  g.addColorStop(1, layer.bottom);
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(0, view.groundY + 2);
+  for (let x = 0; x <= view.w + 8; x += 8) {
+    ctx.lineTo(x, view.groundY - ridgeHeight(layer, x + shift));
+  }
+  ctx.lineTo(view.w + 8, view.groundY + 2);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawTrees() {
+  const layer = LAYERS.near;
+  const shift = game.scroll * layer.factor;
+  for (const tree of scenery.trees) {
+    let sx = (tree.x - shift) % RIDGE_PERIOD;
+    if (sx < -30) sx += RIDGE_PERIOD;
+    if (sx > view.w + 30) continue;
+    const baseY = view.groundY - ridgeHeight(layer, sx + shift) + 2;
+    const h = tree.h;
+    const dark = tree.shade < 0.5 ? "#3d7434" : "#477f3a";
+    const light = tree.shade < 0.5 ? "#52893f" : "#5c9446";
+
+    ctx.fillStyle = "#4b3a2a";
+    ctx.fillRect(sx - 0.7, baseY - h * 0.35, 1.4, h * 0.35);
+    if (tree.cypress) {
+      ctx.fillStyle = dark;
+      ctx.beginPath();
+      ctx.ellipse(sx, baseY - h * 0.6, h * 0.17, h * 0.5, 0, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = light;
+      ctx.beginPath();
+      ctx.ellipse(sx - h * 0.05, baseY - h * 0.68, h * 0.08, h * 0.35, 0, 0, TAU);
+      ctx.fill();
+    } else {
+      const r = h * 0.3;
+      ctx.fillStyle = dark;
+      ctx.beginPath();
+      ctx.arc(sx - r * 0.6, baseY - h * 0.45, r * 0.85, 0, TAU);
+      ctx.arc(sx + r * 0.6, baseY - h * 0.45, r * 0.85, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = light;
+      ctx.beginPath();
+      ctx.arc(sx, baseY - h * 0.65, r, 0, TAU);
+      ctx.fill();
+    }
+  }
+}
+
+function drawTileRow(tile, y, factor) {
+  const offset = (game.scroll * factor) % tile.w;
+  for (let x = -offset; x < view.w; x += tile.w) {
+    ctx.drawImage(tile.canvas, x, y, tile.w + 0.5, tile.h);
+  }
+}
+
+function drawGround() {
+  // meadow
+  const g = ctx.createLinearGradient(0, view.groundY, 0, view.h);
+  g.addColorStop(0, COLORS.fieldTop);
+  g.addColorStop(1, COLORS.fieldBottom);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, view.groundY, view.w, view.h - view.groundY);
+
+  const tex = scenery.fieldTexture;
+  for (let y = view.groundY + 4; y < view.h; y += tex.h) drawTileRow(tex, y, 1);
+
+  // soft haze where the meadow meets the hills
+  const haze = ctx.createLinearGradient(0, view.groundY - 30, 0, view.groundY);
+  haze.addColorStop(0, "rgba(220,238,245,0)");
+  haze.addColorStop(1, "rgba(220,238,245,0.25)");
+  ctx.fillStyle = haze;
+  ctx.fillRect(0, view.groundY - 30, view.w, 30);
+
+  drawTileRow(scenery.grassBack, view.groundY - 16, 1);
+}
+
+function drawScenery() {
+  drawSky();
+  drawClouds();
+  drawRidge(LAYERS.mountains);
+  drawRidge(LAYERS.hills);
+  drawRidge(LAYERS.near);
+  drawTrees();
+  drawGround();
+}
+
+/* =========================================================
+   Render: obstacles & coins
+   ========================================================= */
+function drawCrate(x, y, w, h) {
+  const g = ctx.createLinearGradient(x, y, x, y + h);
+  g.addColorStop(0, COLORS.box);
+  g.addColorStop(1, COLORS.boxBottom);
+  ctx.fillStyle = g;
+  ctx.fillRect(x, y, w, h);
+
+  // planks
+  ctx.strokeStyle = "rgba(90,55,25,0.45)";
+  ctx.lineWidth = 0.8;
+  const planks = Math.max(2, Math.round(h / 11));
+  for (let i = 1; i < planks; i++) {
+    const py = y + (h * i) / planks;
+    ctx.beginPath(); ctx.moveTo(x + 2, py); ctx.lineTo(x + w - 2, py); ctx.stroke();
+  }
+
+  // diagonal brace
+  ctx.strokeStyle = COLORS.boxBrace;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(x + 4, y + h - 4);
+  ctx.lineTo(x + w - 4, y + 4);
+  ctx.stroke();
+
+  // frame
+  ctx.strokeStyle = COLORS.boxFrame;
+  ctx.lineWidth = 3;
+  ctx.strokeRect(x + 1.5, y + 1.5, w - 3, h - 3);
+
+  // light from top-left, shade on the right
+  ctx.fillStyle = "rgba(255,240,210,0.35)";
+  ctx.fillRect(x + 0.5, y + 0.5, w - 1, 1);
+  ctx.fillStyle = "rgba(0,0,0,0.12)";
+  ctx.fillRect(x + w - 3, y, 3, h);
+
+  // nails
+  ctx.fillStyle = COLORS.nail;
+  for (const [nx, ny] of [[3, 3], [w - 3, 3], [3, h - 3], [w - 3, h - 3]]) {
+    ctx.beginPath(); ctx.arc(x + nx, y + ny, 0.8, 0, TAU); ctx.fill();
+  }
+}
+
+function drawObstacle(o) {
+  const type = o.type;
+  // contact shadow
+  ctx.fillStyle = "rgba(20,50,10,0.25)";
+  ctx.beginPath();
+  ctx.ellipse(o.x + type.w / 2 + 3, view.groundY, type.w * 0.6, 2.5, 0, 0, TAU);
+  ctx.fill();
+
+  const bw = type.w / type.boxes;
+  for (let i = 0; i < type.boxes; i++) {
+    drawCrate(o.x + i * bw, view.groundY - type.h, bw, type.h);
+  }
+}
+
+// Gold coin; spins by squashing horizontally.
+function drawCoinShape(x, y, r, squash) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(squash, 1);
+  const g = ctx.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.1, 0, 0, r);
+  g.addColorStop(0, COLORS.coinLight);
+  g.addColorStop(0.55, COLORS.coin);
+  g.addColorStop(1, COLORS.coinDark);
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.fill();
+  ctx.strokeStyle = COLORS.coinEdge;
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  ctx.strokeStyle = "rgba(168,114,0,0.55)";
+  ctx.lineWidth = 0.8;
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.7, 0, TAU); ctx.stroke();
+  ctx.fillStyle = COLORS.coinDark;
+  starPath(ctx, 0, 0.3, r * 0.45, r * 0.2, 5);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawCoins() {
+  for (const c of game.coins) {
+    const squash = Math.max(0.15, Math.abs(Math.cos(game.time * 3.2 + c.phase)));
+    drawCoinShape(c.x, view.groundY - c.h, CONFIG.coinRadius, squash);
+  }
+}
+
+/* =========================================================
+   Render: the kid (original cartoon character, procedural)
+   Angles are measured from straight down; positive = forward.
+   ========================================================= */
+const THIGH = 10, SHIN = 10, UPPER_ARM = 7.5, FOREARM = 7, HIP_HEIGHT = 23;
+
+const POSES = {
+  idle: {
+    legF: { thigh: 0.08, knee: 0.12 }, legB: { thigh: -0.06, knee: 0.1 },
+    armF: { shoulder: 0.15, elbow: 0.4 }, armB: { shoulder: -0.1, elbow: 0.3 },
+    lean: 0.02,
+  },
+  jumpUp: {
+    legF: { thigh: 1.2, knee: 1.8 }, legB: { thigh: -0.2, knee: 1.4 },
+    armF: { shoulder: 2.6, elbow: 0.4 }, armB: { shoulder: 2.2, elbow: 0.5 },
+    lean: 0.05,
+  },
+  jumpDown: {
+    legF: { thigh: 0.7, knee: 0.6 }, legB: { thigh: 0.1, knee: 0.9 },
+    armF: { shoulder: 1.2, elbow: 0.6 }, armB: { shoulder: 1.6, elbow: 0.5 },
+    lean: 0.1,
+  },
+  hit: {
+    legF: { thigh: 0.6, knee: 0.9 }, legB: { thigh: -0.1, knee: 0.5 },
+    armF: { shoulder: 2.5, elbow: 0.5 }, armB: { shoulder: 2.2, elbow: 0.6 },
+    lean: -0.25,
+  },
+};
+
+function lerpPose(a, b, k) {
+  const mix = (p, q) => {
+    const out = {};
+    for (const key in p) out[key] = lerp(p[key], q[key], k);
+    return out;
+  };
+  return {
+    legF: mix(a.legF, b.legF), legB: mix(a.legB, b.legB),
+    armF: mix(a.armF, b.armF), armB: mix(a.armB, b.armB),
+    lean: lerp(a.lean, b.lean, k),
+  };
+}
+
+function runPose(p) {
+  const leg = (q) => ({
+    thigh: 0.2 + 0.7 * Math.sin(TAU * q),
+    knee: 0.25 + 1.8 * Math.max(0, Math.sin(TAU * (q - 0.65))),
+  });
+  const arm = (q) => ({ shoulder: -0.95 * Math.sin(TAU * q), elbow: 1.5 });
+  return { legF: leg(p), legB: leg(p + 0.5), armF: arm(p), armB: arm(p + 0.5), lean: 0.14 };
+}
+
+function currentPose() {
+  if (game.state === "over") return { pose: POSES.hit, bob: 0 };
+  if (game.state === "ready") return { pose: POSES.idle, bob: Math.sin(game.time * 2.2) * 0.4 };
+  if (!runner.onGround) {
+    const k = clamp(0.5 + 0.5 * (runner.vy / CONFIG.jumpVelocity), 0, 1);
+    return { pose: lerpPose(POSES.jumpDown, POSES.jumpUp, k), bob: 0 };
+  }
+  const p = runner.runPhase;
+  return { pose: runPose(p), bob: 1.3 * Math.cos(2 * TAU * (p - 0.45)) };
+}
+
+// Tassel angle from vertical (positive = swings back).
+function tasselAngle() {
+  if (game.state === "over") return 0.35;
+  if (game.state === "ready") return 0.7 + Math.sin(game.time * 2.2) * 0.05;
+  if (!runner.onGround) return clamp(0.8 - runner.vy / 2000, 0.4, 1.3);
+  return 0.85 + 0.2 * Math.sin(TAU * runner.runPhase * 2);
+}
+
+function segment(x1, y1, x2, y2, width, color) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+}
+
+function drawLeg(hx, hy, leg, pal) {
+  const kx = hx + Math.sin(leg.thigh) * THIGH;
+  const ky = hy + Math.cos(leg.thigh) * THIGH;
+  const shinAngle = leg.thigh - leg.knee;
+  const ax = kx + Math.sin(shinAngle) * SHIN;
+  const ay = ky + Math.cos(shinAngle) * SHIN;
+
+  segment(kx, ky, ax, ay, 4.6, pal.skin);            // shin
+  segment(hx, hy, kx, ky, 5.2, pal.skin);            // knee area
+  const sx = hx + Math.sin(leg.thigh) * THIGH * 0.72;
+  const sy = hy + Math.cos(leg.thigh) * THIGH * 0.72;
+  segment(hx, hy, sx, sy, 7.6, pal.shorts);          // shorts
+
+  // chunky sneaker, aligned with the shin
+  ctx.save();
+  ctx.translate(ax, ay);
+  ctx.rotate(-shinAngle);
+  ctx.fillStyle = pal.shoe;
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(-3, -2.8, 10.5, 5, 2.4);
+  else ctx.rect(-3, -2.8, 10.5, 5);
+  ctx.fill();
+  ctx.fillStyle = pal.sole;
+  ctx.fillRect(-3, 1.4, 10.5, 1.5);
+  ctx.restore();
+}
+
+function drawArm(sx, sy, arm, pal) {
+  const ex = sx + Math.sin(arm.shoulder) * UPPER_ARM;
+  const ey = sy + Math.cos(arm.shoulder) * UPPER_ARM;
+  const foreAngle = arm.shoulder + arm.elbow;
+  const hx = ex + Math.sin(foreAngle) * FOREARM;
+  const hy = ey + Math.cos(foreAngle) * FOREARM;
+
+  segment(ex, ey, hx, hy, 3.8, pal.skin);
+  segment(sx, sy, ex, ey, 4.2, pal.skin);
+  ctx.fillStyle = pal.skin;
+  ctx.beginPath(); ctx.arc(hx, hy, 2.4, 0, TAU); ctx.fill();
+
+  // short sleeve
+  const mx = sx + Math.sin(arm.shoulder) * 4;
+  const my = sy + Math.cos(arm.shoulder) * 4;
+  segment(sx, sy, mx, my, 6.8, pal.shirtLine);
+  segment(sx, sy, mx, my, 6, pal.shirt);
+}
+
+function drawTorso() {
+  // torso frame: origin at the hip, y up is negative
+  ctx.fillStyle = KID_FRONT.shorts;                  // waistband
+  ctx.fillRect(-5.5, -2, 11.5, 6);
+
+  const g = ctx.createLinearGradient(-6, 0, 7, 0);
+  g.addColorStop(0, "#dde3ea");
+  g.addColorStop(0.6, "#ffffff");
+  g.addColorStop(1, "#f4f6f9");
+  ctx.fillStyle = g;
+  ctx.strokeStyle = KID_FRONT.shirtLine;
+  ctx.lineWidth = 0.8;
+  ctx.beginPath();
+  ctx.moveTo(-5.8, 1.5);
+  ctx.lineTo(6.2, 1.5);
+  ctx.quadraticCurveTo(7.8, -6, 6.6, -12);
+  ctx.quadraticCurveTo(4.5, -15.5, -0.5, -15.5);
+  ctx.quadraticCurveTo(-5.8, -15, -6.4, -10);
+  ctx.quadraticCurveTo(-7, -4, -5.8, 1.5);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // small green star on the chest
+  ctx.strokeStyle = KID.star;
+  ctx.lineWidth = 0.7;
+  starPath(ctx, 2.6, -8, 2.4, 0.95, 5);
+  ctx.stroke();
+}
+
+function drawHead() {
+  // head frame: origin at the head center, facing right
+  const R = 10;
+
+  // hair at the back of the head
+  ctx.fillStyle = KID.hair;
+  ctx.beginPath();
+  ctx.ellipse(-2.5, -1.5, 8.6, 8.4, 0, 0, TAU);
+  ctx.fill();
+
+  // face
+  ctx.fillStyle = KID_FRONT.skin;
+  ctx.beginPath();
+  ctx.arc(0.8, 0.6, R - 0.6, 0, TAU);
+  ctx.fill();
+
+  // hair over the top/back, clipped to the head
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(0.8, 0.6, R - 0.4, 0, TAU);
+  ctx.clip();
+  ctx.fillStyle = KID.hair;
+  ctx.beginPath();
+  ctx.moveTo(-12, 8);
+  ctx.lineTo(-12, -12);
+  ctx.lineTo(12, -12);
+  ctx.lineTo(10, -4.5);
+  ctx.quadraticCurveTo(4, -6.5, -1.5, -3.5);
+  ctx.quadraticCurveTo(-4.5, 0, -4.2, 6);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  // ear
+  ctx.fillStyle = KID_BACK.skin;
+  ctx.beginPath();
+  ctx.ellipse(-2.2, 1.8, 2, 2.7, 0, 0, TAU);
+  ctx.fill();
+
+  // nose
+  ctx.fillStyle = KID_BACK.skin;
+  ctx.beginPath();
+  ctx.arc(9.6, 2, 1.7, 0, TAU);
+  ctx.fill();
+
+  // big eye
+  ctx.fillStyle = KID.eyeWhite;
+  ctx.beginPath();
+  ctx.ellipse(5.2, -0.6, 2.5, 3.2, 0, 0, TAU);
+  ctx.fill();
+  if (game.state === "over") {
+    // dizzy "x" eye
+    segment(4.1, -1.9, 6.3, 0.7, 0.8, KID.pupil);
+    segment(6.3, -1.9, 4.1, 0.7, 0.8, KID.pupil);
+  } else {
+    ctx.fillStyle = KID.pupil;
+    ctx.beginPath(); ctx.arc(6, -0.3, 1.6, 0, TAU); ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath(); ctx.arc(6.5, -1, 0.55, 0, TAU); ctx.fill();
+  }
+  // eyebrow
+  ctx.strokeStyle = KID.hair;
+  ctx.lineWidth = 0.9;
+  ctx.beginPath();
+  ctx.moveTo(3.4, -4.6);
+  ctx.quadraticCurveTo(5.3, -5.6, 7.2, -4.6);
+  ctx.stroke();
+
+  // cheek + mouth
+  ctx.fillStyle = KID.blush;
+  ctx.beginPath(); ctx.ellipse(4.2, 4.2, 1.9, 1.2, 0, 0, TAU); ctx.fill();
+  ctx.strokeStyle = KID.mouth;
+  ctx.fillStyle = KID.mouth;
+  ctx.lineWidth = 0.8;
+  ctx.beginPath();
+  if (game.state === "over") {
+    ctx.ellipse(7.4, 5.6, 1, 1.3, 0, 0, TAU);       // "oh no"
+    ctx.fill();
+  } else {
+    ctx.moveTo(5.6, 5);
+    ctx.quadraticCurveTo(7.4, 7, 8.9, 4.8);         // smile
+    ctx.stroke();
+  }
+
+  drawFez();
+}
+
+// Red tarbouch (fez) with a black tassel.
+function drawFez() {
+  ctx.save();
+  ctx.translate(0, -7.6);
+  ctx.rotate(-0.12);                                 // worn slightly tilted back
+
+  const g = ctx.createLinearGradient(-7, 0, 7, 0);
+  g.addColorStop(0, KID.fezDark);
+  g.addColorStop(0.45, KID.fez);
+  g.addColorStop(0.8, KID.fezLight);
+  g.addColorStop(1, KID.fez);
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(-7.2, 0.5);
+  ctx.lineTo(7.4, 0.5);
+  ctx.lineTo(5.6, -9);
+  ctx.lineTo(-5.2, -9);
+  ctx.closePath();
+  ctx.fill();
+
+  // top
+  ctx.fillStyle = KID.fezDark;
+  ctx.beginPath();
+  ctx.ellipse(0.2, -9, 5.4, 1.3, 0, 0, TAU);
+  ctx.fill();
+
+  // tassel: cord lies over the crown and hangs off the back edge
+  const a = tasselAngle();
+  const cord = 9;
+  const tx = 0.2 - Math.sin(a) * cord;
+  const ty = -9 + Math.cos(a) * cord;
+  segment(0.2, -9, tx, ty, 0.9, KID.tassel);
+  ctx.fillStyle = KID.tassel;
+  ctx.save();
+  ctx.translate(tx, ty);
+  ctx.rotate(a * 0.35);                              // the tuft mostly hangs down
+  ctx.beginPath();
+  ctx.moveTo(-0.6, -0.5);
+  ctx.lineTo(0.6, -0.5);
+  ctx.lineTo(1.6, 4);
+  ctx.lineTo(-1.6, 4);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  ctx.restore();
+}
+
+function drawRunnerShadow(cx) {
+  const k = clamp(1 - runner.y / 220, 0.3, 1);
+  ctx.fillStyle = `rgba(20,50,10,${0.28 * k})`;
+  ctx.beginPath();
+  ctx.ellipse(cx + 2, view.groundY, 13 * k, 2.6 * k, 0, 0, TAU);
+  ctx.fill();
+}
+
+function rotatePoint(px, py, a) {
+  return { x: px * Math.cos(a) - py * Math.sin(a), y: px * Math.sin(a) + py * Math.cos(a) };
+}
+
+function drawRunner() {
+  const cx = CONFIG.runner.x + CONFIG.runner.w / 2;
+  const feetY = view.groundY - runner.y;
+  drawRunnerShadow(cx);
+
+  const { pose, bob } = currentPose();
+  ctx.save();
+  ctx.translate(cx, feetY);
+  if (game.state === "over") ctx.rotate(-0.22);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  const hipX = 0, hipY = -HIP_HEIGHT + bob;
+  const sh = rotatePoint(1, -12.5, pose.lean);
+  const shX = hipX + sh.x, shY = hipY + sh.y;
+
+  // far side first
+  drawArm(shX - 1, shY, pose.armB, KID_BACK);
+  drawLeg(hipX - 1.2, hipY, pose.legB, KID_BACK);
+
+  // torso and head (rotated with the body lean)
+  ctx.save();
+  ctx.translate(hipX, hipY);
+  ctx.rotate(pose.lean);
+  segment(1, -14, 1.5, -17, 4, KID_FRONT.skin);      // neck
+  drawTorso();
+  ctx.translate(1.5, -26);
+  ctx.rotate(-pose.lean * 0.6);                      // head stays more upright
+  drawHead();
+  ctx.restore();
+
+  // near side
+  drawLeg(hipX + 1.2, hipY, pose.legF, KID_FRONT);
+  drawArm(shX + 1, shY, pose.armF, KID_FRONT);
+
+  ctx.restore();
+}
+
+/* =========================================================
+   Render: particles, UI
+   ========================================================= */
+function drawParticles() {
+  for (const p of game.particles) {
+    const k = p.life / p.max;
+    ctx.fillStyle = `rgba(${p.rgb},${0.6 * k})`;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * (2 - k), 0, TAU);
+    ctx.fill();
+  }
+}
+
+function drawPopups() {
+  for (const p of game.popups) {
+    ctx.globalAlpha = clamp(p.life / p.max * 1.5, 0, 1);
+    drawText(p.text, p.x, p.y, 13, "center", COLORS.gold, GLOW);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHitbox(b) {
+  ctx.strokeStyle = COLORS.hitbox;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(b.left, b.top, b.right - b.left, b.bottom - b.top);
+}
+
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+
+function drawText(text, x, y, size, align, color, glow) {
+  ctx.font = `bold ${size}px ${FONT}`;
+  ctx.textAlign = align;
+  ctx.textBaseline = "middle";
+  if (glow) {
+    // light outline keeps text readable over clouds (cheaper than shadowBlur)
+    ctx.strokeStyle = glow;
+    ctx.lineWidth = Math.max(2.5, size * 0.18);
+    ctx.lineJoin = "round";
+    ctx.strokeText(text, x, y);
+  }
+  ctx.fillStyle = color || COLORS.text;
+  ctx.fillText(text, x, y);
+}
+
+function drawCenteredText(text, y, size, color, glow) {
+  drawText(text, view.w / 2, y, size, "center", color, glow);
+}
+
+function fillRoundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(x, y, w, h, r);
+  else ctx.rect(x, y, w, h);
+  ctx.fill();
+}
+
+const pad5 = (n) => String(n).padStart(5, "0");
+const GLOW = "rgba(255,255,255,0.75)";
+
+function drawHud() {
+  const right = view.w - 14 - view.safe.right;
+  const top = view.safe.top;
+  drawText(`${t("score")} ${pad5(game.score)}`, right, top + 24, 16, "right", COLORS.text, GLOW);
+  drawText(`${t("best")} ${pad5(Math.max(game.best, game.score))}`, right, top + 44, 12, "right", COLORS.textSoft, GLOW);
+
+  // coin counter
+  const label = `× ${game.coinsCollected}`;
+  drawText(label, right, top + 64, 13, "right", COLORS.text, GLOW);
+  ctx.font = `bold 13px ${FONT}`;
+  const w = ctx.measureText(label).width;
+  drawCoinShape(right - w - 9, top + 64, 6, 1);
+}
+
+function drawButton() {
+  const b = buttonRect();
+  ctx.fillStyle = COLORS.button;
+  fillRoundRect(b.x, b.y, b.w, b.h, 8);
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+
+  if (game.state === "playing") {
+    ctx.fillStyle = COLORS.text;                       // pause icon "II"
+    const barH = b.h * 0.45, barW = b.h * 0.13;
+    ctx.fillRect(cx - barW * 1.6, cy - barH / 2, barW, barH);
+    ctx.fillRect(cx + barW * 0.6, cy - barH / 2, barW, barH);
+  } else if (game.state === "paused") {
+    ctx.fillStyle = COLORS.text;                       // play icon
+    const s = b.h * 0.24;
+    ctx.beginPath();
+    ctx.moveTo(cx - s * 0.7, cy - s);
+    ctx.lineTo(cx + s, cy);
+    ctx.lineTo(cx - s * 0.7, cy + s);
+    ctx.closePath();
+    ctx.fill();
+  } else {
+    // segmented switch: the active language is highlighted
+    const half = b.w / 2, inset = 3;
+    const activeX = lang === "dar" ? b.x : b.x + half;
+    ctx.fillStyle = COLORS.text;
+    fillRoundRect(activeX + inset, b.y + inset, half - inset * 2, b.h - inset * 2, 6);
+    const size = Math.round(b.h * 0.36);
+    drawText("DAR", b.x + half / 2, cy + 1, size, "center", lang === "dar" ? "#ffffff" : COLORS.textSoft);
+    drawText("EN", b.x + half * 1.5, cy + 1, size, "center", lang === "en" ? "#ffffff" : COLORS.textSoft);
+  }
+}
+
+function drawGameOverPanel() {
+  const w = 270, h = 170;
+  const x = (view.w - w) / 2;
+  const y = Math.max(view.groundY - 235, 56 + view.safe.top);
+  ctx.fillStyle = COLORS.panel;
+  fillRoundRect(x, y, w, h, 14);
+
+  drawCenteredText(t("over"), y + 30, 26);
+  drawCenteredText(`${t("score")}: ${game.score}`, y + 62, 16);
+  drawCenteredText(`${t("coins")}: ${game.coinsCollected}`, y + 86, 14, COLORS.gold);
+  if (game.newBest) {
+    drawCenteredText(`${t("newBest")} 🎉`, y + 110, 14, COLORS.accent);
+  } else {
+    drawCenteredText(`${t("best")}: ${game.best}`, y + 110, 14, COLORS.textSoft);
+  }
+  if (game.overTimer >= CONFIG.restartDelay) {
+    drawCenteredText(t("retry"), y + 144, 12, COLORS.textSoft);
+  }
+}
+
+function render() {
+  const base = view.dpr * view.scale;
+  ctx.setTransform(base, 0, 0, base, 0, 0);
+
+  // screen shake on Game Over (world only, not the UI)
+  ctx.save();
+  if (game.shake > 0) {
+    const a = CONFIG.shakeAmp * (game.shake / CONFIG.shakeTime);
+    ctx.translate(rand(-a, a), rand(-a, a));
+  }
+  drawScenery();
+  for (const o of game.obstacles) drawObstacle(o);
+  drawCoins();
+  drawRunner();
+  drawTileRow(scenery.grassFront, view.groundY - 10, 1);
+  drawParticles();
+  drawPopups();
+
+  if (DEBUG) {
+    drawHitbox(runnerHitbox());
+    for (const o of game.obstacles) drawHitbox(obstacleHitbox(o));
+  }
+  ctx.restore();
+
+  drawHud();
+
+  const midY = Math.max(view.groundY - 150, 90 + view.safe.top);
+  if (game.state === "ready") {
+    drawCenteredText(t("title"), midY, 30, COLORS.text, GLOW);
+    drawCenteredText(t("start"), midY + 36, 16, COLORS.text, GLOW);
+  } else if (game.state === "paused") {
+    ctx.fillStyle = COLORS.dim;
+    ctx.fillRect(0, 0, view.w, view.h);
+    drawCenteredText(t("paused"), midY, 30, "#ffffff");
+    drawCenteredText(t("resume"), midY + 36, 16, "#ffffff");
+  } else if (game.state === "over") {
+    drawGameOverPanel();
+  }
+
+  drawButton();
+}
+
+/* =========================================================
+   Main loop: fixed-step physics, render every frame
+   ========================================================= */
+let lastTime = performance.now();
+let accumulator = 0;
+
+function frame(now) {
+  const dt = Math.min((now - lastTime) / 1000, CONFIG.maxFrameDt);
+  lastTime = now;
+  accumulator += dt;
+  while (accumulator >= CONFIG.step) {
+    update(CONFIG.step);
+    accumulator -= CONFIG.step;
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+
+view.portrait = window.innerHeight > window.innerWidth;
+resize();
+resetGame();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
